@@ -3,15 +3,159 @@
 SoftwareSerial ldSerial = SoftwareSerial(6, 5);
 
 
+#pragma region Utils
+void printByte(byte b) {
+	if (b < 16)
+	{
+		Serial.print("0");
+	}
+	Serial.print(b, HEX);
+}
+
+void printBytes(const uint8_t* data, size_t len, int highlightAt) {
+	for (size_t i = 0; i < len; i++)
+	{
+		if (data[i] < 16) {
+			Serial.print(0);
+		}
+		Serial.print(data[i], HEX);
+	}
+	if (highlightAt > -1 && highlightAt < len) {
+		Serial.println();
+		for (size_t i = 0; i < highlightAt; i++)
+		{
+			Serial.print("  ");
+		}
+		Serial.println("^^");
+	}
+}
+#pragma endregion
+
+
+
+#pragma region Commands
+struct {
+	byte header[4]{ 0xFD, 0xFC, 0xFB, 0xFA };
+} COMMAND_HEADER;
+
+struct {
+	byte MFR[4]{ 0x04, 0x03, 0x02, 0x01 };
+} COMMAND_MFR;
+
+struct {
+	byte payload[2]{ 0xA0, 0x00 };
+} GET_FIRMWARE;
+
+struct {
+	byte commandWord[2]{ 0xFF, 0x00 };
+	byte commandValue[2]{ 0x01, 0x00 };
+} ENABLE_CONFIG_COMMANDS;
+
+struct {
+	byte commandWord[2]{ 0xFE, 0x00 };
+} DISABLE_CONFIG_COMMANDS;
+
+void sendMessage(void* buf, short size) {
+	ldSerial.write((byte*)&COMMAND_HEADER, sizeof(COMMAND_HEADER));
+
+	ldSerial.write((byte*)&size, 2);
+	ldSerial.write((byte*)buf, size);
+
+	ldSerial.write((byte*)&COMMAND_MFR, sizeof(COMMAND_MFR));
+	ldSerial.flush();
+}
+#pragma endregion
+
+
+#pragma region ConfigCommandResponse
+enum AckStatus : short {
+	SUCCESS = 0x0000, FAILURE = 0x0001,
+};
+
+struct ConfigurationCommandResponse
+{
+	byte HEADER[4]{ 0xFD, 0xFC, 0xFB, 0xFA };
+	short length;
+	byte command[2];
+	AckStatus ackStatus;
+	byte protocollVersion[2];
+	byte buffer[2];
+	byte MFR[4]{ 4,3,2,1 };
+
+	static bool tryRead(byte* buffer, size_t bufferSize, ConfigurationCommandResponse* out) {
+		size_t window = 0;
+		while (window + sizeof(ConfigurationCommandResponse) < bufferSize) {
+			if (buffer[window] != 0xFD ||
+				buffer[window + 1] != 0xFC ||
+				buffer[window + 2] != 0xFB ||
+				buffer[window + 3] != 0xFA) {
+				window++;
+				continue;
+			}
+			short length = buffer[window + offsetof(ConfigurationCommandResponse, length) + 1] << 8 | buffer[window + offsetof(ConfigurationCommandResponse, length)];
+
+
+			if (length != 8) {
+				return false;
+			}
+			if (buffer[window + offsetof(ConfigurationCommandResponse, command)] != 0xFF || buffer[window + offsetof(ConfigurationCommandResponse, command) + 1] != 0x01)
+			{
+				//printBytes(buffer[window + offsetof(ConfigurationCommandResponse, command)], 2, -1);
+				return false;
+			}
+
+
+
+			if (buffer[window + offsetof(ConfigurationCommandResponse, MFR)] != 0x04 ||
+				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 1] != 0x03 ||
+				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 2] != 0x02 ||
+				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 3] != 0x01)
+			{
+				return false;
+			}
+
+			memcpy(out, buffer + window, sizeof(ConfigurationCommandResponse));
+			return true;
+
+		}
+
+		return false;
+	}
+
+	void prettyPrint() {
+		Serial.print("ConfigurationCommandResponse: ");
+		Serial.print("Ack status: ");
+		switch (ackStatus)
+		{
+		case SUCCESS:
+			Serial.println("SUCCESS");
+			break;
+		case FAILURE:
+			Serial.println("FAILURE");
+			break;
+		default:
+			Serial.println("UNKNOWN");
+			break;
+		}
+	}
+};
+#pragma endregion
+
+
+
+#pragma region DetectionDatagramm
 enum DataType : byte {
 	EngineeringMode = 0x01, TargetDataComposition = 0x02
 };
-
 
 enum TargetState : byte
 {
 	NoTarget = 0x00, SportsTarget = 0x01, StationaryTarget = 0x02, StationaryAndStationaryTargets = 0x03
 };
+
+// These obviously redundant declarations are made necessary because the arduino preprocessor can't handle user defined types in overloads because apparently we're still stuck in the 1960
+static void prettyPrint(DataType t);
+static void prettyPrint(TargetState s);
 
 static void prettyPrint(DataType t) {
 	switch (t)
@@ -24,7 +168,6 @@ static void prettyPrint(DataType t) {
 		break;
 	}
 }
-
 
 static void prettyPrint(TargetState s) {
 	switch (s)
@@ -43,30 +186,19 @@ static void prettyPrint(TargetState s) {
 		break;
 	}
 }
-struct Datagramm
-{
-	byte frameHeader[4];
-	byte intraDataLength[2];// 0c 00 
-	byte commandWord[2]; // a0 01
-	byte type[2];
-	byte major[2];
-	byte minor[4];
-	byte __[4];
-};
-
 
 struct DetectionDatagramm {
 	byte frameHeader[4]{ 0xF4, 0xF3, 0xF2, 0xF1 };
 
-	 short frameDataLength;
+	short frameDataLength;
 	DataType type;
 	byte head{ 0xAA };
 	TargetState targetState;
-	 short distance;
+	short distance;
 	byte exerciseTargetEnergyValue;
-	 short stationaryTargetDistance1;
+	short stationaryTargetDistance1;
 	byte stationaryTargetEnergyValue;
-	 short detectionDistanceCm;
+	short detectionDistanceCm;
 	byte tail{ 0x55 };
 	byte check{ 0x00 };
 
@@ -159,79 +291,9 @@ struct DetectionDatagramm {
 		//printBytes(MFR, 4);
 	}
 };
+#pragma endregion
 
-enum AckStatus : short {
-	SUCCESS = 0x0000, FAILURE = 0x0001,
-};
-
-struct ConfigurationCommandResponse
-{
-	byte HEADER[4]{ 0xFD, 0xFC, 0xFB, 0xFA };
-	short length;//should be 8
-	byte command[2];
-	AckStatus ackStatus;
-	byte protocollVersion[2];
-	byte buffer[2];
-	byte MFR[4]{ 4,3,2,1 };
-
-	static bool tryRead(byte* buffer, size_t bufferSize, ConfigurationCommandResponse* out) {
-		size_t window = 0;
-		while (window + sizeof(ConfigurationCommandResponse) < bufferSize) {
-			if (buffer[window] != 0xFD ||
-				buffer[window + 1] != 0xFC ||
-				buffer[window + 2] != 0xFB || 
-				buffer[window + 3] != 0xFA) {
-				window++;
-				continue;
-			}
-			short length = buffer[window + offsetof(ConfigurationCommandResponse, length) + 1] << 8 | buffer[window + offsetof(ConfigurationCommandResponse, length)];
-
-
-			if (length != 8) {
-				return false;
-			}
-			if (buffer[window + offsetof(ConfigurationCommandResponse, command)] != 0xFF || buffer[window + offsetof(ConfigurationCommandResponse, command) + 1] != 0x01)
-			{
-				//printBytes(buffer[window + offsetof(ConfigurationCommandResponse, command)], 2, -1);
-				return false;
-			}
-
-			
-
-			if (buffer[window + offsetof(ConfigurationCommandResponse, MFR)] != 0x04 ||
-				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 1] != 0x03 ||
-				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 2] != 0x02 ||
-				buffer[window + offsetof(ConfigurationCommandResponse, MFR) + 3] != 0x01)
-			{
-				return false;
-			}
-
-			memcpy(out, buffer + window, sizeof(ConfigurationCommandResponse));
-			return true;
-
-		}
-
-		return false;
-	}
-
-	void prettyPrint() {
-		Serial.print("ConfigurationCommandResponse: ");
-		Serial.print("Ack status: ");
-		switch (ackStatus)
-		{
-		case SUCCESS:
-			Serial.println("SUCCESS");
-			break;
-		case FAILURE:
-			Serial.println("FAILURE");
-			break;
-		default:
-			Serial.println("UNKNOWN");
-			break;
-		}
-	}
-};
-
+#pragma region FirmwareCommandResponse
 struct FirmwareCommandResponse {
 	byte HEADER[4]{ 0xFD, 0xFC, 0xFB, 0xFA };
 	short length;//should be 12
@@ -292,62 +354,8 @@ struct FirmwareCommandResponse {
 	}
 };
 
+#pragma endregion
 
-void printByte(byte b) {
-	if (b < 16)
-	{
-		Serial.print("0");
-	}
-	Serial.print(b, HEX);
-}
-
-void printBytes(const uint8_t* data, size_t len, int highlightAt) {
-	for (size_t i = 0; i < len; i++)
-	{
-		if (data[i] < 16) {
-			Serial.print(0);
-		}
-		Serial.print(data[i],HEX);
-	}
-	if (highlightAt > -1 && highlightAt < len) {
-		Serial.println();
-		for (size_t i = 0; i < highlightAt; i++)
-		{
-			Serial.print("  ");
-		}
-		Serial.println("^^");
-	}
-}
-
-
-void sendMessage(void* buf, short size) {
-	ldSerial.write(0xFD);
-	ldSerial.write(0xFC);
-	ldSerial.write(0xFB);
-	ldSerial.write(0xFA);
-
-	ldSerial.write((byte*) &size, 2);
-	ldSerial.write((byte*) buf, size);
-
-	ldSerial.write(0x04);
-	ldSerial.write(0x03);
-	ldSerial.write(0x02);
-	ldSerial.write(0x01);
-	ldSerial.flush();
-}
-
-struct {
-	byte payload[2]{ 0xA0, 0x00 };
-} GET_FIRMWARE;
-
-struct {
-	byte commandWord[2]{ 0xFF, 0x00 };
-	byte commandValue[2]{ 0x01, 0x00 };
-} ENABLE_CONFIG_COMMANDS;
-
-struct {
-	byte commandWord[2]{ 0xFE, 0x00 };
-} DISABLE_CONFIG_COMMANDS;
 
 
 void setup() {
@@ -408,39 +416,34 @@ void loop() {
 			cursor++;
 		}
 
-		DetectionDatagramm dd;
-		auto isDetectionDatagramm = DetectionDatagramm::tryRead(buffer, sizeof(buffer), &dd);
-		
-		if (isDetectionDatagramm) {
-			dd.prettyPrint();
-			Serial.println("Resetting buffer");
-			memset(buffer, 0, sizeof(buffer));
-			cursor = 0;
-			return;
-		}
-
-		ConfigurationCommandResponse cCR;
-		auto isConfigurationCommandResponse = ConfigurationCommandResponse::tryRead(buffer, sizeof(buffer), &cCR);
-		if (isConfigurationCommandResponse) {
-			cCR.prettyPrint();
-			Serial.println("Resetting buffer");
-			memset(buffer, 0, sizeof(buffer));
-			cursor = 0;
-		}
-
-		FirmwareCommandResponse fCR;
-		auto isFirmwareCommandResponse = FirmwareCommandResponse::tryRead(buffer, sizeof(buffer), &fCR);
-		if (isFirmwareCommandResponse) {
-			fCR.prettyPrint();
-			Serial.println("Resetting buffer");
-			memset(buffer, 0, sizeof(buffer));
-			cursor = 0;
-		}
+		//DetectionDatagramm dd;
+		//auto isDetectionDatagramm = DetectionDatagramm::tryRead(buffer, sizeof(buffer), &dd);
+		//
+		//if (isDetectionDatagramm) {
+		//	dd.prettyPrint();
+		//	Serial.println("Resetting buffer");
+		//	memset(buffer, 0, sizeof(buffer));
+		//	cursor = 0;
+		//	return;
+		//}
+		//
+		//ConfigurationCommandResponse cCR;
+		//auto isConfigurationCommandResponse = ConfigurationCommandResponse::tryRead(buffer, sizeof(buffer), &cCR);
+		//if (isConfigurationCommandResponse) {
+		//	cCR.prettyPrint();
+		//	Serial.println("Resetting buffer");
+		//	memset(buffer, 0, sizeof(buffer));
+		//	cursor = 0;
+		//}
+		//
+		//FirmwareCommandResponse fCR;
+		//auto isFirmwareCommandResponse = FirmwareCommandResponse::tryRead(buffer, sizeof(buffer), &fCR);
+		//if (isFirmwareCommandResponse) {
+		//	fCR.prettyPrint();
+		//	Serial.println("Resetting buffer");
+		//	memset(buffer, 0, sizeof(buffer));
+		//	cursor = 0;
+		//}
 	}
-	
-	
-
-	//printBytes(buffer, sizeof(buffer), -1);
-	//Serial.println();
 }
 
